@@ -153,6 +153,16 @@ fn unary_grad(device: &Device) -> Result<()> {
     let grad_x = grads.get(x).context("no grad for x")?;
     assert_eq!(y.to_vec1::<f32>()?, [-3.0, -1.0, -4.0, -0.15]);
     assert_eq!(grad_x.to_vec1::<f32>()?, [-1.0, -1.0, -1.0, -1.0]);
+
+    let x = Var::new(&[-1f32, 0., 2.], device)?;
+    let y = x.relu()?;
+    let grads = y.backward()?;
+    let grad_x = grads.get(&x).context("no grad for x")?;
+    assert_eq!(y.to_vec1::<f32>()?, [0., 0., 2.]);
+    assert_eq!(grad_x.to_vec1::<f32>()?, [0., 0., 1.]);
+
+    let x = Var::new(&[3f32, 1., 4., 0.15], device)?;
+    let x = x.as_tensor();
     let y = x.affine(0.2, 1.)?;
     let grads = y.backward()?;
     let grad_x = grads.get(x).context("no grad for x")?;

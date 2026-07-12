@@ -633,7 +633,7 @@ impl Tensor {
                     }
                     Op::Unary(arg, UnaryOp::Relu) => {
                         let sum_grad = grads.or_insert(arg)?;
-                        let relu_grad = arg.ge(&arg.zeros_like()?)?.to_dtype(arg.dtype())?;
+                        let relu_grad = arg.gt(&arg.zeros_like()?)?.to_dtype(arg.dtype())?;
                         *sum_grad = sum_grad.add(&(&grad * relu_grad)?)?
                     }
                     Op::Unary(arg, UnaryOp::Silu) => {
