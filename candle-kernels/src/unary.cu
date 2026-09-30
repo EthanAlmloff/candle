@@ -231,3 +231,31 @@ UNARY_OP(float, usign_f32, sign_(x))
 UNARY_OP(double, usign_f64, sign_(x))
 UNARY_OP(float, usigmoid_f32, sigmoid_fwd(x))
 UNARY_OP(double, usigmoid_f64, sigmoid_fwd(x))
+
+// Fused ELU backward, matching PyTorch's aten::elu_backward path.
+extern "C" __global__ void elu_bwd_f32(
+    const size_t numel,
+    const size_t num_dims,
+    const size_t *info,
+    const float alpha,
+    const float *node,
+    const float *grad,
+    float *out) {
+    const size_t *dims = info;
+    const size_t *node_strides = info ? info + num_dims : nullptr;
+    const size_t *grad_strides = info ? info + 2 * num_dims : nullptr;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < numel; i += blockDim.x * gridDim.x) {
+        size_t node_i = i;
+        size_t grad_i = i;
+        if (info != nullptr && !is_contiguous(num_dims, dims, node_strides)) {
+            node_i = get_strided_index(i, num_dims, dims, node_strides);
+        }
+        if (info != nullptr && !is_contiguous(num_dims, dims, grad_strides)) {
+            grad_i = get_strided_index(i, num_dims, dims, grad_strides);
+        }
+        const float y = node[node_i];
+        const float derivative = y > 0.f ? 1.f : y + alpha;
+        out[i] = grad[grad_i] * derivative;
+    }
+}

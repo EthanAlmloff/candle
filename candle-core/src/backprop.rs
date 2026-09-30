@@ -1,6 +1,18 @@
 //! Methods for backpropagation of gradients.
 use crate::op::{BinaryOp, Op, ReduceOp, UnaryOp};
 use crate::{Error, Result, Tensor, TensorId};
+#[cfg(feature = "cuda")]
+use crate::{CudaStorage, DType, Layout, Shape};
+#[cfg(feature = "cuda")]
+use crate::custom_op::CustomOp2;
+#[cfg(feature = "cuda")]
+use crate::backend::BackendStorage;
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::WrapErr;
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::cudarc::driver::PushKernelArg;
+#[cfg(feature = "cuda")]
+use crate::builder_arg;
 use std::collections::{hash_map::Entry, HashMap};
 
 // arg has been reduced to node via reduce_dims, expand it back to arg.
@@ -24,6 +36,66 @@ thread_local! {
             },
             Err(_) => false,
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct EluBackwardF32 {
+    alpha: f64,
+}
+
+#[cfg(feature = "cuda")]
+impl CustomOp2 for EluBackwardF32 {
+    fn name(&self) -> &'static str { "elu-backward-f32" }
+
+    fn cpu_fwd(
+        &self, _: &crate::CpuStorage, _: &Layout, _: &crate::CpuStorage, _: &Layout,
+    ) -> Result<(crate::CpuStorage, Shape)> {
+        crate::bail!("fused ELU backward is CUDA-only")
+    }
+
+    fn cuda_fwd(
+        &self, node: &CudaStorage, node_l: &Layout,
+        grad: &CudaStorage, grad_l: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        if node.dtype() != DType::F32 || grad.dtype() != DType::F32 {
+            crate::bail!("fused ELU backward requires f32")
+        }
+        let shape = node_l.shape().clone();
+        let dims = shape.dims();
+        let numel = shape.elem_count();
+        let info = if node_l.is_contiguous() && grad_l.is_contiguous() {
+            crate::cuda_backend::SlicePtrOrNull::Null
+        } else {
+            crate::cuda_backend::SlicePtrOrNull::params_from_vec(
+                &node.device,
+                [dims, node_l.stride(), grad_l.stride()].concat(),
+            )?
+        };
+        let func = node.device.get_or_load_func(
+            "elu_bwd_f32", &crate::cuda_backend::kernels::UNARY,
+        )?;
+        let out = unsafe { node.device.alloc::<f32>(numel)? };
+        let mut builder = func.builder();
+        builder_arg!(builder, numel);
+        builder_arg!(builder, dims.len());
+        info.builder_arg(&mut builder);
+        builder_arg!(builder, self.alpha as f32);
+        let node_slice = node.as_cuda_slice::<f32>()?.slice(node_l.start_offset()..);
+        let grad_slice = grad.as_cuda_slice::<f32>()?.slice(grad_l.start_offset()..);
+        builder.arg(&node_slice);
+        builder.arg(&grad_slice);
+        builder.arg(&out);
+        unsafe {
+            builder.launch(cudarc::driver::LaunchConfig::for_num_elems(numel as u32))
+        }.w()?;
+        Ok((CudaStorage::wrap_cuda_slice(out, node.device.clone()), shape))
+    }
+
+    fn metal_fwd(
+        &self, _: &crate::MetalStorage, _: &Layout, _: &crate::MetalStorage, _: &Layout,
+    ) -> Result<(crate::MetalStorage, Shape)> {
+        crate::bail!("fused ELU backward is CUDA-only")
     }
 }
 
@@ -183,24 +255,18 @@ impl Tensor {
             if let Some(op) = node.op() {
                 match op {
                     Op::Binary(lhs, rhs, BinaryOp::Add) => {
-                        let lhs_sum_grad = grads.or_insert(lhs)?;
-                        *lhs_sum_grad = lhs_sum_grad.add(&grad)?;
-                        let rhs_sum_grad = grads.or_insert(rhs)?;
-                        *rhs_sum_grad = rhs_sum_grad.add(&grad)?;
+                        grads.accumulate(lhs, grad.clone())?;
+                        grads.accumulate(rhs, grad)?;
                     }
                     Op::Binary(lhs, rhs, BinaryOp::Sub) => {
-                        let lhs_sum_grad = grads.or_insert(lhs)?;
-                        *lhs_sum_grad = lhs_sum_grad.add(&grad)?;
-                        let rhs_sum_grad = grads.or_insert(rhs)?;
-                        *rhs_sum_grad = rhs_sum_grad.sub(&grad)?;
+                        grads.accumulate(lhs, grad.clone())?;
+                        grads.accumulate(rhs, grad.neg()?)?;
                     }
                     Op::Binary(lhs, rhs, BinaryOp::Mul) => {
                         let lhs_grad = grad.mul(rhs)?;
-                        let lhs_sum_grad = grads.or_insert(lhs)?;
-                        *lhs_sum_grad = lhs_sum_grad.add(&lhs_grad)?;
+                        grads.accumulate(lhs, lhs_grad)?;
                         let rhs_grad = grad.mul(lhs)?;
-                        let rhs_sum_grad = grads.or_insert(rhs)?;
-                        *rhs_sum_grad = rhs_sum_grad.add(&rhs_grad)?;
+                        grads.accumulate(rhs, rhs_grad)?;
                     }
                     Op::Binary(lhs, rhs, BinaryOp::Div) => {
                         let lhs_grad = grad.div(rhs)?;
@@ -645,13 +711,30 @@ impl Tensor {
                     }
                     Op::Elu(arg, alpha) => {
                         // d/dx elu(x) = 1 for x > 0, alpha * e^x for x <= 0
+                        #[cfg(feature = "cuda")]
+                        if *alpha > 0. && matches!(arg.device(), crate::Device::Cuda(_)) {
+                            let fused = node.apply_op2_no_bwd(
+                                &grad,
+                                &EluBackwardF32 { alpha: *alpha },
+                            )?;
+                            grads.accumulate(arg, fused)?;
+                            continue;
+                        }
                         let sum_grad = grads.or_insert(arg)?;
-                        let zeros = arg.zeros_like()?;
-                        let positive_mask = arg.gt(&zeros)?.to_dtype(arg.dtype())?;
-                        let negative_mask = arg.le(&zeros)?.to_dtype(arg.dtype())?;
-                        // node == alpha * (e^x - 1) for x <= 0, reuse it
-                        let negative_exp_mask = (negative_mask * (*node + *alpha))?;
-                        let combined_mask = (positive_mask + negative_exp_mask)?;
+                        // For alpha > 0, the sign of the output identifies the
+                        // branch, so reuse the forward result and avoid making
+                        // both gt/le masks and converting them to the data dtype.
+                        let combined_mask = if *alpha > 0. {
+                            let positive = node.gt(&node.zeros_like()?)?;
+                            positive.where_cond(&node.ones_like()?, &(*node + *alpha)?)?
+                        } else {
+                            let zeros = arg.zeros_like()?;
+                            let positive_mask = arg.gt(&zeros)?.to_dtype(arg.dtype())?;
+                            let negative_mask = arg.le(&zeros)?.to_dtype(arg.dtype())?;
+                            // node == alpha * (e^x - 1) for x <= 0, reuse it
+                            let negative_exp_mask = (negative_mask * (*node + *alpha))?;
+                            (positive_mask + negative_exp_mask)?
+                        };
                         *sum_grad = sum_grad.add(&(grad * combined_mask)?)?
                     }
                     Op::Powf(arg, e) => {
@@ -774,6 +857,22 @@ impl GradStore {
             }
         };
         Ok(grad)
+    }
+
+    // Avoid launching an add against a freshly allocated zero tensor for the
+    // first contribution to a gradient. Most autograd nodes contribute once;
+    // only later contributions need an actual accumulation kernel.
+    fn accumulate(&mut self, tensor: &Tensor, grad: Tensor) -> Result<()> {
+        match self.0.entry(tensor.id()) {
+            Entry::Vacant(entry) => {
+                entry.insert(grad);
+            }
+            Entry::Occupied(mut entry) => {
+                let sum = entry.get().add(&grad)?;
+                *entry.get_mut() = sum;
+            }
+        }
+        Ok(())
     }
 
     /// Extend this gradient store with the contents of another.

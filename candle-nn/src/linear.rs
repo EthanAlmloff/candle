@@ -41,6 +41,16 @@ impl Linear {
 
 impl super::Module for Linear {
     fn forward(&self, x: &Tensor) -> candle::Result<Tensor> {
+        // PyTorch routes ordinary 2-D Linear layers through addmm, keeping
+        // the bias in the same autograd node. Use Candle's matching fused
+        // graph on CUDA; other devices retain the established path below.
+        if matches!(x.device(), candle::Device::Cuda(_)) && x.rank() == 2 {
+            let w = self.weight.t()?;
+            return match &self.bias {
+                None => x.matmul(&w),
+                Some(bias) => x.matmul_add(&w, bias),
+            };
+        }
         // When possible, we avoid using a broadcasted matmul as it is much slower
         // than the standard matmul for the cuda and cpu backends.
         let x = match *x.dims() {

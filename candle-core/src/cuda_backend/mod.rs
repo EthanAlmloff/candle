@@ -352,6 +352,37 @@ impl Map1Any for FastReduce<'_> {
             stride.push(src_stride[dim_idx]);
         }
         let el_to_sum_per_block = src_el / dst_el;
+        // A full contiguous FP32 reduction otherwise runs in a single block.
+        // First reduce independent chunks, then reduce the small partial array.
+        if matches!(self.1, ReduceOp::Sum)
+            && T::DTYPE == DType::F32
+            && dst_el == 1
+            && layout.is_contiguous()
+            && src_el > 4096
+        {
+            let chunk = 4096usize;
+            let partial_count = src_el.div_ceil(chunk);
+            let partial = unsafe { dev.alloc::<T>(partial_count)? };
+            let info = SlicePtrOrNull::params_from_vec(dev, vec![src_el, 1])?;
+            let source = src.slice(layout.start_offset()..);
+            let func = dev.get_or_load_func("fast_sum_f32", &kernels::REDUCE)?;
+            let mut builder = func.builder();
+            barg!(builder, src_el);
+            barg!(builder, chunk);
+            barg!(builder, 1usize);
+            info.builder_arg(&mut builder);
+            builder.arg(&source);
+            builder.arg(&partial);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (partial_count as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }.w()?;
+            let partial_layout = Layout::contiguous((partial_count,));
+            return FastReduce(&[0], ReduceOp::Sum).f(&partial, dev, &partial_layout, wrap);
+        }
         // The reduction loop requires the shared array to be properly initialized and for
         // this we want the number of threads to be a power of two.
         let block_dim = usize::min(1024, el_to_sum_per_block).next_power_of_two();
@@ -1292,6 +1323,50 @@ impl CudaStorage {
 
     pub fn as_cuda_slice_mut<T: CudaDType>(&mut self) -> Result<&mut CudaSlice<T>> {
         T::as_cuda_slice_mut(self)
+    }
+
+    /// FP32 addmm path: seed C with a row-broadcast bias and use beta=1 so
+    /// cuBLAS computes C = A*B + bias in the GEMM call.
+    pub fn matmul_add_f32(
+        &self,
+        rhs: &Self,
+        bias: &Self,
+        bmnk: (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+        bias_l: &Layout,
+    ) -> Result<Self> {
+        let (b, m, n, k) = bmnk;
+        if b != 1 || !lhs_l.is_contiguous() || !rhs_l.is_contiguous()
+            || !bias_l.is_contiguous() || bias_l.shape().dims() != [n]
+        {
+            crate::bail!("fused addmm requires contiguous 2-D FP32 inputs")
+        }
+        let lhs = match &self.slice {
+            CudaStorageSlice::F32(v) => &v.slice(lhs_l.start_offset()..),
+            _ => crate::bail!("fused addmm requires f32 lhs"),
+        };
+        let rhs = match &rhs.slice {
+            CudaStorageSlice::F32(v) => &v.slice(rhs_l.start_offset()..),
+            _ => crate::bail!("fused addmm requires f32 rhs"),
+        };
+        let bias = match &bias.slice {
+            CudaStorageSlice::F32(v) => &v.slice(bias_l.start_offset()..),
+            _ => crate::bail!("fused addmm requires f32 bias"),
+        };
+        let dev = &self.device;
+        let elem_count = m * n;
+        let mut out = unsafe { dev.alloc::<f32>(elem_count)? };
+        let fill = dev.get_or_load_func("fill_bias_f32", &kernels::BINARY)?;
+        let mut fill_builder = fill.builder();
+        barg!(fill_builder, elem_count);
+        barg!(fill_builder, n);
+        fill_builder.arg(bias);
+        fill_builder.arg(&out);
+        unsafe { fill_builder.launch(LaunchConfig::for_num_elems(elem_count as u32)) }.w()?;
+        let cfg = gemm_config(1., 1., (b, m, n, k), lhs_l, rhs_l)?;
+        unsafe { gemm_strided_batched_f32(&dev.blas, cfg, rhs, lhs, &mut out) }.w()?;
+        Ok(Self { slice: CudaStorageSlice::F32(out), device: dev.clone() })
     }
 
     pub fn transfer_to_device(&self, dst: &CudaDevice) -> Result<Self> {

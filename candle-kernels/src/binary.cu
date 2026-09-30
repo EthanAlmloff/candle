@@ -112,3 +112,11 @@ BINARY_OP_OUT(double, uint8_t, ge_f64, x >= y)
 BINARY_OP_OUT(uint8_t, uint8_t, ge_u8, x >= y)
 BINARY_OP_OUT(uint32_t, uint8_t, ge_u32, x >= y)
 BINARY_OP_OUT(int64_t, uint8_t, ge_i64, x >= y)
+
+extern "C" __global__ void fill_bias_f32(
+    const size_t numel, const size_t n, const float *bias, float *out) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < numel; i += blockDim.x * gridDim.x) {
+        out[i] = bias[i % n];
+    }
+}

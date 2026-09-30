@@ -2,6 +2,7 @@
 #![allow(clippy::redundant_closure_call)]
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
+use crate::custom_op::CustomOp3;
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
 use crate::{bail, storage::Storage, DType, Device, Error, Layout, Result, Shape};
@@ -40,6 +41,71 @@ pub struct Tensor_ {
     is_variable: bool,
     dtype: DType,
     device: Device,
+}
+
+struct MatmulAdd;
+
+impl CustomOp3 for MatmulAdd {
+    fn name(&self) -> &'static str { "matmul-add" }
+
+    fn cpu_fwd(
+        &self, _: &crate::CpuStorage, _: &Layout, _: &crate::CpuStorage, _: &Layout,
+        _: &crate::CpuStorage, _: &Layout,
+    ) -> Result<(crate::CpuStorage, Shape)> {
+        bail!("matmul_add custom op is CUDA-only")
+    }
+
+    fn cuda_fwd(
+        &self, lhs: &crate::CudaStorage, lhs_l: &Layout,
+        rhs: &crate::CudaStorage, rhs_l: &Layout,
+        bias: &crate::CudaStorage, bias_l: &Layout,
+    ) -> Result<(crate::CudaStorage, Shape)> {
+        let ad = lhs_l.shape().dims();
+        let bd = rhs_l.shape().dims();
+        if ad.len() != 2 || bd.len() != 2 || bias_l.shape().rank() != 1 {
+            bail!("matmul_add expects 2-D matrices and a 1-D bias")
+        }
+        let m = ad[0];
+        let k = ad[1];
+        let k2 = bd[0];
+        let n = bd[1];
+        if k != k2 || bias_l.shape().dims()[0] != n {
+            bail!("matmul_add shape mismatch")
+        }
+        let out_shape = Shape::from((m, n));
+        if lhs.dtype() == DType::F32
+            && rhs.dtype() == DType::F32
+            && bias.dtype() == DType::F32
+            && lhs_l.is_contiguous()
+            && rhs_l.is_contiguous()
+            && bias_l.is_contiguous()
+        {
+            let out = lhs.matmul_add_f32(rhs, bias, (1, m, n, k), lhs_l, rhs_l, bias_l)?;
+            Ok((out, out_shape))
+        } else {
+            let out_l = Layout::contiguous(out_shape.clone());
+            let mat = lhs.matmul(rhs, (1, m, n, k), lhs_l, rhs_l)?;
+            let bias_l = bias_l.broadcast_as(&out_shape)?;
+            let out = mat.binary_impl::<crate::op::Add>(bias, &out_l, &bias_l)?;
+            Ok((out, out_shape))
+        }
+    }
+
+    fn metal_fwd(
+        &self, _: &crate::MetalStorage, _: &Layout, _: &crate::MetalStorage, _: &Layout,
+        _: &crate::MetalStorage, _: &Layout,
+    ) -> Result<(crate::MetalStorage, Shape)> {
+        bail!("matmul_add custom op is CUDA-only")
+    }
+
+    fn bwd(
+        &self, lhs: &Tensor, rhs: &Tensor, _bias: &Tensor, _: &Tensor, grad: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let lhs_grad = grad.matmul(&rhs.t()?)?;
+        let rhs_grad = lhs.t()?.matmul(grad)?;
+        let bias_grad = grad.sum(0)?;
+        Ok((Some(lhs_grad), Some(rhs_grad), Some(bias_grad)))
+    }
 }
 
 impl AsRef<Tensor> for Tensor {
@@ -1535,6 +1601,15 @@ impl Tensor {
         )?;
         let op = BackpropOp::new2(self, rhs, Op::Matmul);
         Ok(from_storage(storage, c_shape, op, false))
+    }
+
+    /// Matrix multiplication followed by a bias add, with a fused autograd
+    /// node. CUDA linear layers use this to mirror PyTorch's addmm graph.
+    pub fn matmul_add(&self, rhs: &Self, bias: &Self) -> Result<Self> {
+        if !matches!(self.device(), Device::Cuda(_)) || self.rank() != 2 || rhs.rank() != 2 {
+            return self.matmul(rhs)?.broadcast_add(bias);
+        }
+        self.apply_op3(rhs, bias, MatmulAdd)
     }
 
     /// Matrix-multiplication with broadcasting support.
