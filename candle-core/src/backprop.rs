@@ -763,16 +763,13 @@ impl Tensor {
                         let (arg_grad1, arg_grad2, arg_grad3) =
                             c.bwd(arg1, arg2, arg3, node, &grad)?;
                         if let Some(arg_grad1) = arg_grad1 {
-                            let sum_grad = grads.or_insert(arg1)?;
-                            *sum_grad = sum_grad.add(&arg_grad1)?
+                            grads.accumulate(arg1, arg_grad1)?;
                         }
                         if let Some(arg_grad2) = arg_grad2 {
-                            let sum_grad = grads.or_insert(arg2)?;
-                            *sum_grad = sum_grad.add(&arg_grad2)?
+                            grads.accumulate(arg2, arg_grad2)?;
                         }
                         if let Some(arg_grad3) = arg_grad3 {
-                            let sum_grad = grads.or_insert(arg3)?;
-                            *sum_grad = sum_grad.add(&arg_grad3)?
+                            grads.accumulate(arg3, arg_grad3)?;
                         }
                     }
                     Op::Unary(arg, UnaryOp::Sqr) => {
