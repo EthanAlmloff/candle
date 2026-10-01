@@ -1,6 +1,9 @@
 //! Various optimization algorithms.
 use candle::{Result, Tensor, Var};
 
+#[cfg(feature = "cuda")]
+mod fused_adamw;
+
 /// The interface optimizers should implement.
 pub trait Optimizer: Sized {
     type Config: Sized;
@@ -163,6 +166,21 @@ impl Optimizer for AdamW {
             let m = &var.first_moment;
             let v = &var.second_moment;
             if let Some(g) = grads.get(theta) {
+                #[cfg(feature = "cuda")]
+                if let Some((next_m, next_v, next_theta)) = fused_adamw::update(
+                    theta.as_tensor(),
+                    m.as_tensor(),
+                    v.as_tensor(),
+                    g,
+                    &self.params,
+                    scale_m,
+                    scale_v,
+                )? {
+                    m.set(&next_m)?;
+                    v.set(&next_v)?;
+                    theta.set(&next_theta)?;
+                    continue;
+                }
                 // This involves locking 3 RWLocks per params, if the parameters are large this
                 // should not be an issue but this may be problematic with models with lots of
                 // small parameters.
